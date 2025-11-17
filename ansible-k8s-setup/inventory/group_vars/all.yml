@@ -3,18 +3,15 @@
 # Global Variables for Kubernetes Cluster
 # ============================================
 
-# Cluster Information
+# Cluster / Environment info
 cluster_name: petclinic
-env_name: test  # Changed from 'environment' to avoid reserved name
-
-# Backward compatibility for templates that still use "environment"
-environment: "{{ env_name }}"
+env_name: test  # اسم البيئة اللي يبان في اسم الكلاستر (petclinic-test مثلاً)
 
 # Kubernetes Version
 k8s_version: "1.28"
 
 # Control Plane Endpoint (Load Balancer DNS)
-# Will be updated by Ansible from Terraform output (GitHub Action sed)
+# GitHub Actions هيعدّل السطر ده بـ NLB DNS:6443 بعد Terraform
 control_plane_endpoint: "master-nlb.example.com:6443"
 
 # Network Configuration
@@ -29,8 +26,8 @@ api_server_port: 6443
 ingress_version: "v1.9.5"
 
 # Timeouts and Retries
-kubeadm_init_timeout: 600
-kubeadm_join_timeout: 300
+kubeadm_init_timeout: 900        # 15 دقيقة للـ init (أكتر من الـ default)
+kubeadm_join_timeout: 600        # 10 دقائق للـ join
 pod_ready_timeout: 300
 
 # Directories
