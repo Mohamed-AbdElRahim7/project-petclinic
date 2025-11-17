@@ -1,0 +1,152 @@
+name: 01 - Terraform Plan
+
+# ✅ FIX: يشتغل على PR و Push أيضاً
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'terraform-k8s-infrastructure/**'
+  
+  push:
+    branches:
+      - main
+    paths:
+      - 'terraform-k8s-infrastructure/**'
+  
+  workflow_dispatch:  # يسمح بالتشغيل اليدوي
+
+env:
+  TF_VERSION: '1.6.0'
+  AWS_REGION: 'us-east-1'
+
+jobs:
+  terraform-plan:
+    name: Review Infrastructure Changes
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🔐 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 🔧 Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: 🎨 Terraform Format Check
+        id: fmt
+        working-directory: terraform-k8s-infrastructure
+        run: terraform fmt -check -recursive
+        continue-on-error: true
+
+      - name: ⚙️ Terraform Init
+        id: init
+        working-directory: terraform-k8s-infrastructure
+        run: |
+          echo "════════════════════════════════════════"
+          echo "⚙️ Initializing Terraform..."
+          echo "════════════════════════════════════════"
+          terraform init
+
+      - name: ✅ Terraform Validate
+        id: validate
+        working-directory: terraform-k8s-infrastructure
+        run: |
+          echo "════════════════════════════════════════"
+          echo "✅ Validating Terraform Configuration..."
+          echo "════════════════════════════════════════"
+          terraform validate -no-color
+
+      - name: 📋 Terraform Plan
+        id: plan
+        working-directory: terraform-k8s-infrastructure
+        run: |
+          echo "════════════════════════════════════════"
+          echo "📋 Running Terraform Plan..."
+          echo "════════════════════════════════════════"
+          terraform plan -no-color -input=false -out=tfplan
+          
+          # Show plan in readable format
+          terraform show -no-color tfplan > plan.txt
+          
+          echo "✅ Plan completed!"
+        continue-on-error: true
+
+      - name: 📊 Display Plan Summary
+        if: always()
+        run: |
+          echo "════════════════════════════════════════"
+          echo "📊 Terraform Plan Summary"
+          echo "════════════════════════════════════════"
+          echo "Format: ${{ steps.fmt.outcome }}"
+          echo "Init: ${{ steps.init.outcome }}"
+          echo "Validate: ${{ steps.validate.outcome }}"
+          echo "Plan: ${{ steps.plan.outcome }}"
+
+      - name: 📦 Upload Plan Artifact
+        if: steps.plan.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan
+          path: terraform-k8s-infrastructure/tfplan
+          retention-days: 7
+
+      - name: 💬 Comment on Pull Request
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request'
+        env:
+          PLAN: "${{ steps.plan.outputs.stdout }}"
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('terraform-k8s-infrastructure/plan.txt', 'utf8');
+            
+            const output = `
+            ## 🏗️ Terraform Plan Results
+            
+            #### 🎨 Format: \`${{ steps.fmt.outcome }}\`
+            #### ⚙️ Init: \`${{ steps.init.outcome }}\`
+            #### ✅ Validate: \`${{ steps.validate.outcome }}\`
+            #### 📋 Plan: \`${{ steps.plan.outcome }}\`
+            
+            <details><summary>📖 Show Plan Details</summary>
+            
+            \`\`\`terraform
+            ${plan.slice(0, 60000)}
+            \`\`\`
+            
+            </details>
+            
+            **👤 Triggered by:** @${{ github.actor }}
+            **📅 Date:** ${new Date().toLocaleString('en-US', { timeZone: 'Africa/Cairo' })}
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+
+      - name: ❌ Fail if Plan Failed
+        if: steps.plan.outcome == 'failure'
+        run: |
+          echo "════════════════════════════════════════"
+          echo "❌ Terraform Plan Failed!"
+          echo "════════════════════════════════════════"
+          exit 1

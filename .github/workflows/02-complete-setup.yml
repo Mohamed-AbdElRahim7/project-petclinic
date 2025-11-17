@@ -1,0 +1,320 @@
+name: Complete K8s Cluster Setup
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'terraform-k8s-infrastructure/**'
+      - 'ansible-k8s-setup/**'
+
+env:
+  TF_VERSION: "1.6.0"
+  AWS_REGION: "us-east-1"
+  ANSIBLE_HOST_KEY_CHECKING: "False"
+
+jobs:
+  terraform-apply:
+    name: Deploy Infrastructure
+    runs-on: ubuntu-latest
+    
+    outputs:
+      bastion_ip: ${{ steps.extract.outputs.bastion_ip }}
+      lb_dns: ${{ steps.extract.outputs.lb_dns }}
+    
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+      
+      - name: 🔐 Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: 🔧 Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+      
+      - name: ⚙️ Terraform Init & Apply
+        working-directory: terraform-k8s-infrastructure
+        run: |
+          terraform init
+          terraform apply -auto-approve -input=false
+      
+      - name: 📊 Extract Outputs
+        id: extract
+        working-directory: terraform-k8s-infrastructure
+        run: |
+          BASTION_IP=$(terraform output -raw bastion_public_ip)
+          LB_DNS=$(terraform output -raw master_load_balancer_dns)
+          
+          echo "bastion_ip=${BASTION_IP}" >> "$GITHUB_OUTPUT"
+          echo "lb_dns=${LB_DNS}" >> "$GITHUB_OUTPUT"
+          
+          mkdir -p /tmp/terraform-outputs
+          terraform output -raw bastion_public_ip > /tmp/terraform-outputs/bastion_ip.txt
+          terraform output -raw master_load_balancer_dns > /tmp/terraform-outputs/lb_dns.txt
+          terraform output -json master_private_ips > /tmp/terraform-outputs/master_ips.json
+          terraform output -json worker_private_ips > /tmp/terraform-outputs/worker_ips.json
+          terraform output -raw ssh_private_key > /tmp/terraform-outputs/petclinic-test-key.pem
+          chmod 400 /tmp/terraform-outputs/petclinic-test-key.pem
+      
+      - name: 📦 Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-outputs
+          path: /tmp/terraform-outputs
+          retention-days: 7
+      
+      - name: ⏳ Wait for EC2 Instances (8 minutes)
+        run: |
+          echo "⏳ Waiting 8 minutes for EC2 instances to:"
+          echo "  • Complete boot process"
+          echo "  • Run user-data scripts"
+          echo "  • Install Kubernetes components"
+          echo ""
+          for i in {1..30}; do
+            echo -ne "Progress: $((i*100/30))% [$i/30]\r"
+            sleep 10
+          done
+          echo ""
+          echo "✅ Wait completed!"
+
+  ansible-provision:
+    name: Configure Kubernetes
+    runs-on: ubuntu-latest
+    needs: terraform-apply
+    
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+      
+      - name: 🐍 Setup Python & Ansible
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      
+      - name: 📦 Install Ansible
+        run: |
+          pip install --upgrade pip
+          pip install ansible
+          ansible --version
+      
+      - name: 🔐 Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: 📥 Download Outputs
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-outputs
+          path: /tmp/terraform-outputs
+      
+      - name: 🔑 Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          cp /tmp/terraform-outputs/petclinic-test-key.pem ~/.ssh/
+          chmod 400 ~/.ssh/petclinic-test-key.pem
+          
+          cat >> ~/.ssh/config <<EOF
+          Host *
+              StrictHostKeyChecking no
+              UserKnownHostsFile=/dev/null
+          EOF
+          chmod 600 ~/.ssh/config
+      
+      - name: 📝 Generate Inventory
+        working-directory: ansible-k8s-setup
+        run: |
+          BASTION_IP=$(cat /tmp/terraform-outputs/bastion_ip.txt)
+          LB_DNS=$(cat /tmp/terraform-outputs/lb_dns.txt)
+          MASTER_IPS=$(jq -r '.[]' /tmp/terraform-outputs/master_ips.json)
+          WORKER_IPS=$(jq -r '.[]' /tmp/terraform-outputs/worker_ips.json)
+          
+          cat > inventory/hosts.ini <<EOF
+          [bastion]
+          bastion ansible_host=${BASTION_IP} ansible_user=ubuntu
+          
+          [masters]
+          EOF
+          
+          i=1
+          for ip in $MASTER_IPS; do
+            echo "master-${i} ansible_host=${ip}" >> inventory/hosts.ini
+            i=$((i+1))
+          done
+          
+          cat >> inventory/hosts.ini <<EOF
+          
+          [workers]
+          EOF
+          
+          i=1
+          for ip in $WORKER_IPS; do
+            echo "worker-${i} ansible_host=${ip}" >> inventory/hosts.ini
+            i=$((i+1))
+          done
+          
+          cat >> inventory/hosts.ini <<'EOF'
+          
+          [first_master]
+          master-1
+          
+          [other_masters]
+          master-2
+          master-3
+          
+          [k8s_cluster:children]
+          masters
+          workers
+          
+          [all:children]
+          bastion
+          k8s_cluster
+          
+          [k8s_cluster:vars]
+          ansible_user=ubuntu
+          ansible_python_interpreter=/usr/bin/python3
+          ansible_ssh_private_key_file=~/.ssh/petclinic-test-key.pem
+          EOF
+          
+          echo "ansible_ssh_common_args='-o ProxyCommand=\"ssh -W %h:%p -i ~/.ssh/petclinic-test-key.pem -o StrictHostKeyChecking=no ubuntu@${BASTION_IP}\"'" >> inventory/hosts.ini
+          
+          cat >> inventory/hosts.ini <<'EOF'
+          
+          [masters:vars]
+          k8s_role=master
+          
+          [workers:vars]
+          k8s_role=worker
+          
+          [bastion:vars]
+          ansible_ssh_common_args='-o StrictHostKeyChecking=no'
+          EOF
+          
+          sed -i "s|control_plane_endpoint:.*|control_plane_endpoint: \"${LB_DNS}:6443\"|" inventory/group_vars/all.yml
+      
+      - name: ⏳ Wait & Test Connectivity
+        working-directory: ansible-k8s-setup
+        run: |
+          echo "Testing connectivity to nodes..."
+          RETRY=0
+          MAX_RETRY=10
+          
+          while [ $RETRY -lt $MAX_RETRY ]; do
+            if ansible all -i inventory/hosts.ini -m ping; then
+              echo "✅ All nodes reachable!"
+              break
+            fi
+            RETRY=$((RETRY+1))
+            if [ $RETRY -lt $MAX_RETRY ]; then
+              echo "⏳ Retry $RETRY/$MAX_RETRY in 30 seconds..."
+              sleep 30
+            fi
+          done
+      
+      - name: "Step 2: Init First Master"
+        working-directory: ansible-k8s-setup
+        run: |
+          echo "=========================================="
+          echo "Initializing First Master..."
+          echo "=========================================="
+          ansible-playbook -i inventory/hosts.ini playbooks/02-init-first-master.yml
+      
+      - name: "Step 3: Join Other Masters"
+        working-directory: ansible-k8s-setup
+        run: |
+          echo "=========================================="
+          echo "Joining Other Masters..."
+          echo "=========================================="
+          ansible-playbook -i inventory/hosts.ini playbooks/03-join-masters.yml
+      
+      - name: "Step 4: Join Workers"
+        working-directory: ansible-k8s-setup
+        run: |
+          echo "=========================================="
+          echo "Joining Workers..."
+          echo "=========================================="
+          ansible-playbook -i inventory/hosts.ini playbooks/04-join-workers.yml
+      
+      - name: "Step 5: Install & Verify CNI (CRITICAL - Takes 3-5 min)"
+        working-directory: ansible-k8s-setup
+        run: |
+          echo "=========================================="
+          echo "Installing Calico CNI..."
+          echo "=========================================="
+          echo "This step is CRITICAL and takes time!"
+          echo "We will wait for ALL nodes to be Ready"
+          echo "=========================================="
+          ansible-playbook -i inventory/hosts.ini playbooks/05-install-cni.yml
+      
+      - name: "Step 6: Create Namespaces"
+        working-directory: ansible-k8s-setup
+        run: |
+          echo "=========================================="
+          echo "Creating Namespaces..."
+          echo "=========================================="
+          ansible-playbook -i inventory/hosts.ini playbooks/06-create-namespaces.yml
+      
+      - name: "Step 7: Final Setup & Verification"
+        working-directory: ansible-k8s-setup
+        run: |
+          echo "=========================================="
+          echo "Final Setup & Verification..."
+          echo "=========================================="
+          echo "This includes:"
+          echo "  • Ingress NGINX installation"
+          echo "  • kubectl setup"
+          echo "  • Final health checks"
+          echo "=========================================="
+          ansible-playbook -i inventory/hosts.ini playbooks/99-final-fixes.yml
+      
+      - name: 📥 Fetch Kubeconfig
+        continue-on-error: true
+        run: |
+          BASTION_IP=$(cat /tmp/terraform-outputs/bastion_ip.txt)
+          scp -i ~/.ssh/petclinic-test-key.pem -o StrictHostKeyChecking=no \
+            ubuntu@${BASTION_IP}:~/.kube/config /tmp/kubeconfig || echo "Kubeconfig fetch failed"
+      
+      - name: 📦 Upload Kubeconfig
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kubeconfig
+          path: /tmp/kubeconfig
+          retention-days: 7
+        continue-on-error: true
+      
+      - name: 🎉 Final Summary
+        if: always()
+        run: |
+          BASTION_IP=$(cat /tmp/terraform-outputs/bastion_ip.txt)
+          LB_DNS=$(cat /tmp/terraform-outputs/lb_dns.txt)
+          
+          echo ""
+          echo "╔════════════════════════════════════════╗"
+          echo "║     Kubernetes Cluster Ready!        ║"
+          echo "╚════════════════════════════════════════╝"
+          echo ""
+          echo "Connection Info:"
+          echo "  Bastion: ${BASTION_IP}"
+          echo "  API:     ${LB_DNS}:6443"
+          echo ""
+          echo "SSH Access:"
+          echo "  ssh -i petclinic-test-key.pem ubuntu@${BASTION_IP}"
+          echo ""
+          echo "Verify cluster:"
+          echo "  kubectl get nodes"
+          echo "  kubectl get pods -A"
+          echo ""
+
