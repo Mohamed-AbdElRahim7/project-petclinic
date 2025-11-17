@@ -1,5 +1,2 @@
 last isa
 ..
-kk
-fs
-qd
