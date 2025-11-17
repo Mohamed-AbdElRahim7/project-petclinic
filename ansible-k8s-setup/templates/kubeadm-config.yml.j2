@@ -2,6 +2,7 @@
 # ============================================
 # Kubeadm Configuration for HA Cluster (3 Masters)
 # ============================================
+
 apiVersion: kubeadm.k8s.io/v1beta3
 kind: InitConfiguration
 bootstrapTokens:
@@ -14,6 +15,7 @@ bootstrapTokens:
   - authentication
 
 localAPIEndpoint:
+  # أول master بيعلن الـ API على الـ Private IP بتاعه
   advertiseAddress: {{ ansible_default_ipv4.address }}
   bindPort: {{ api_server_port }}
 
@@ -31,13 +33,8 @@ kind: ClusterConfiguration
 kubernetesVersion: v{{ k8s_version }}.0
 clusterName: {{ cluster_name }}-{{ env_name }}
 
-# ✅ للـ first master: استخدم local IP
-# ✅ للـ join: استخدم NLB
-{% if inventory_hostname in groups['first_master'] %}
-controlPlaneEndpoint: "{{ ansible_default_ipv4.address }}:{{ api_server_port }}"
-{% else %}
+# HA Endpoint — NLB من Terraform (GitHub Actions بيعدّل all.yml ويكتب NLB هنا)
 controlPlaneEndpoint: "{{ control_plane_endpoint }}"
-{% endif %}
 
 certificatesDir: {{ k8s_pki_dir }}
 imageRepository: registry.k8s.io
@@ -48,10 +45,9 @@ networking:
   serviceSubnet: {{ service_cidr }}
 
 apiServer:
-  timeoutForControlPlane: 10m0s
+  timeoutForControlPlane: 10m0s    # نزود الوقت شوية بدل 4 دقائق
   certSANs:
-  # ✅ نضيف الـ NLB في الـ certificates عشان نقدر نستخدمه بعدين
-  - "{{ control_plane_endpoint.split(':')[0] }}"
+  - "{{ control_plane_endpoint.split(':')[0] }}"  # DNS بتاع NLB
   - "{{ ansible_default_ipv4.address }}"
   - "{{ ansible_hostname }}"
   - "localhost"
@@ -141,4 +137,5 @@ kind: KubeProxyConfiguration
 bindAddress: 0.0.0.0
 mode: iptables
 clusterCIDR: {{ pod_network_cidr }}
+
 metricsBindAddress: 0.0.0.0:10249
