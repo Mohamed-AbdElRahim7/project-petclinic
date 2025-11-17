@@ -1,320 +1,250 @@
-name: Complete K8s Cluster Setup
+---
+# Playbook 2: تهيئة أول master node
+# الغرض: إنشاء الـ Kubernetes cluster على أول master
 
-on:
-  workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - 'terraform-k8s-infrastructure/**'
-      - 'ansible-k8s-setup/**'
+- name: Initialize First Master Node
+  hosts: first_master
+  gather_facts: yes
+  become: yes
 
-env:
-  TF_VERSION: "1.6.0"
-  AWS_REGION: "us-east-1"
-  ANSIBLE_HOST_KEY_CHECKING: "False"
+  vars:
+    kubeadm_config_file: /tmp/kubeadm-config.yaml
+    kubeadm_init_timeout: 900  # 15 minutes
 
-jobs:
-  terraform-apply:
-    name: Deploy Infrastructure
-    runs-on: ubuntu-latest
-    
-    outputs:
-      bastion_ip: ${{ steps.extract.outputs.bastion_ip }}
-      lb_dns: ${{ steps.extract.outputs.lb_dns }}
-    
-    steps:
-      - name: 📥 Checkout
-        uses: actions/checkout@v4
-      
-      - name: 🔐 Configure AWS
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
-          aws-region: ${{ env.AWS_REGION }}
-      
-      - name: 🔧 Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ env.TF_VERSION }}
-          terraform_wrapper: false
-      
-      - name: ⚙️ Terraform Init & Apply
-        working-directory: terraform-k8s-infrastructure
-        run: |
-          terraform init
-          terraform apply -auto-approve -input=false
-      
-      - name: 📊 Extract Outputs
-        id: extract
-        working-directory: terraform-k8s-infrastructure
-        run: |
-          BASTION_IP=$(terraform output -raw bastion_public_ip)
-          LB_DNS=$(terraform output -raw master_load_balancer_dns)
-          
-          echo "bastion_ip=${BASTION_IP}" >> "$GITHUB_OUTPUT"
-          echo "lb_dns=${LB_DNS}" >> "$GITHUB_OUTPUT"
-          
-          mkdir -p /tmp/terraform-outputs
-          terraform output -raw bastion_public_ip > /tmp/terraform-outputs/bastion_ip.txt
-          terraform output -raw master_load_balancer_dns > /tmp/terraform-outputs/lb_dns.txt
-          terraform output -json master_private_ips > /tmp/terraform-outputs/master_ips.json
-          terraform output -json worker_private_ips > /tmp/terraform-outputs/worker_ips.json
-          terraform output -raw ssh_private_key > /tmp/terraform-outputs/petclinic-test-key.pem
-          chmod 400 /tmp/terraform-outputs/petclinic-test-key.pem
-      
-      - name: 📦 Upload Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: terraform-outputs
-          path: /tmp/terraform-outputs
-          retention-days: 7
-      
-      - name: ⏳ Wait for EC2 Instances (8 minutes)
-        run: |
-          echo "⏳ Waiting 8 minutes for EC2 instances to:"
-          echo "  • Complete boot process"
-          echo "  • Run user-data scripts"
-          echo "  • Install Kubernetes components"
-          echo ""
-          for i in {1..30}; do
-            echo -ne "Progress: $((i*100/30))% [$i/30]\r"
-            sleep 10
-          done
-          echo ""
-          echo "✅ Wait completed!"
+  tasks:
+    - name: Check if Kubernetes is already initialized
+      stat:
+        path: /etc/kubernetes/admin.conf
+      register: k8s_initialized
 
-  ansible-provision:
-    name: Configure Kubernetes
-    runs-on: ubuntu-latest
-    needs: terraform-apply
-    
-    steps:
-      - name: 📥 Checkout
-        uses: actions/checkout@v4
-      
-      - name: 🐍 Setup Python & Ansible
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      
-      - name: 📦 Install Ansible
-        run: |
-          pip install --upgrade pip
-          pip install ansible
-          ansible --version
-      
-      - name: 🔐 Configure AWS
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
-          aws-region: ${{ env.AWS_REGION }}
-      
-      - name: 📥 Download Outputs
-        uses: actions/download-artifact@v4
-        with:
-          name: terraform-outputs
-          path: /tmp/terraform-outputs
-      
-      - name: 🔑 Setup SSH
-        run: |
-          mkdir -p ~/.ssh
-          cp /tmp/terraform-outputs/petclinic-test-key.pem ~/.ssh/
-          chmod 400 ~/.ssh/petclinic-test-key.pem
-          
-          cat >> ~/.ssh/config <<EOF
-          Host *
-              StrictHostKeyChecking no
-              UserKnownHostsFile=/dev/null
-          EOF
-          chmod 600 ~/.ssh/config
-      
-      - name: 📝 Generate Inventory
-        working-directory: ansible-k8s-setup
-        run: |
-          BASTION_IP=$(cat /tmp/terraform-outputs/bastion_ip.txt)
-          LB_DNS=$(cat /tmp/terraform-outputs/lb_dns.txt)
-          MASTER_IPS=$(jq -r '.[]' /tmp/terraform-outputs/master_ips.json)
-          WORKER_IPS=$(jq -r '.[]' /tmp/terraform-outputs/worker_ips.json)
-          
-          cat > inventory/hosts.ini <<EOF
-          [bastion]
-          bastion ansible_host=${BASTION_IP} ansible_user=ubuntu
-          
-          [masters]
-          EOF
-          
-          i=1
-          for ip in $MASTER_IPS; do
-            echo "master-${i} ansible_host=${ip}" >> inventory/hosts.ini
-            i=$((i+1))
-          done
-          
-          cat >> inventory/hosts.ini <<EOF
-          
-          [workers]
-          EOF
-          
-          i=1
-          for ip in $WORKER_IPS; do
-            echo "worker-${i} ansible_host=${ip}" >> inventory/hosts.ini
-            i=$((i+1))
-          done
-          
-          cat >> inventory/hosts.ini <<'EOF'
-          
-          [first_master]
-          master-1
-          
-          [other_masters]
-          master-2
-          master-3
-          
-          [k8s_cluster:children]
-          masters
-          workers
-          
-          [all:children]
-          bastion
-          k8s_cluster
-          
-          [k8s_cluster:vars]
-          ansible_user=ubuntu
-          ansible_python_interpreter=/usr/bin/python3
-          ansible_ssh_private_key_file=~/.ssh/petclinic-test-key.pem
-          EOF
-          
-          echo "ansible_ssh_common_args='-o ProxyCommand=\"ssh -W %h:%p -i ~/.ssh/petclinic-test-key.pem -o StrictHostKeyChecking=no ubuntu@${BASTION_IP}\"'" >> inventory/hosts.ini
-          
-          cat >> inventory/hosts.ini <<'EOF'
-          
-          [masters:vars]
-          k8s_role=master
-          
-          [workers:vars]
-          k8s_role=worker
-          
-          [bastion:vars]
-          ansible_ssh_common_args='-o StrictHostKeyChecking=no'
-          EOF
-          
-          sed -i "s|control_plane_endpoint:.*|control_plane_endpoint: \"${LB_DNS}:6443\"|" inventory/group_vars/all.yml
-      
-      - name: ⏳ Wait & Test Connectivity
-        working-directory: ansible-k8s-setup
-        run: |
-          echo "Testing connectivity to nodes..."
-          RETRY=0
-          MAX_RETRY=10
-          
-          while [ $RETRY -lt $MAX_RETRY ]; do
-            if ansible all -i inventory/hosts.ini -m ping; then
-              echo "✅ All nodes reachable!"
-              break
-            fi
-            RETRY=$((RETRY+1))
-            if [ $RETRY -lt $MAX_RETRY ]; then
-              echo "⏳ Retry $RETRY/$MAX_RETRY in 30 seconds..."
-              sleep 30
-            fi
-          done
-      
-      - name: "Step 2: Init First Master"
-        working-directory: ansible-k8s-setup
-        run: |
-          echo "=========================================="
-          echo "Initializing First Master..."
-          echo "=========================================="
-          ansible-playbook -i inventory/hosts.ini playbooks/02-init-first-master.yml
-      
-      - name: "Step 3: Join Other Masters"
-        working-directory: ansible-k8s-setup
-        run: |
-          echo "=========================================="
-          echo "Joining Other Masters..."
-          echo "=========================================="
-          ansible-playbook -i inventory/hosts.ini playbooks/03-join-masters.yml
-      
-      - name: "Step 4: Join Workers"
-        working-directory: ansible-k8s-setup
-        run: |
-          echo "=========================================="
-          echo "Joining Workers..."
-          echo "=========================================="
-          ansible-playbook -i inventory/hosts.ini playbooks/04-join-workers.yml
-      
-      - name: "Step 5: Install & Verify CNI (CRITICAL - Takes 3-5 min)"
-        working-directory: ansible-k8s-setup
-        run: |
-          echo "=========================================="
-          echo "Installing Calico CNI..."
-          echo "=========================================="
-          echo "This step is CRITICAL and takes time!"
-          echo "We will wait for ALL nodes to be Ready"
-          echo "=========================================="
-          ansible-playbook -i inventory/hosts.ini playbooks/05-install-cni.yml
-      
-      - name: "Step 6: Create Namespaces"
-        working-directory: ansible-k8s-setup
-        run: |
-          echo "=========================================="
-          echo "Creating Namespaces..."
-          echo "=========================================="
-          ansible-playbook -i inventory/hosts.ini playbooks/06-create-namespaces.yml
-      
-      - name: "Step 7: Final Setup & Verification"
-        working-directory: ansible-k8s-setup
-        run: |
-          echo "=========================================="
-          echo "Final Setup & Verification..."
-          echo "=========================================="
-          echo "This includes:"
-          echo "  • Ingress NGINX installation"
-          echo "  • kubectl setup"
-          echo "  • Final health checks"
-          echo "=========================================="
-          ansible-playbook -i inventory/hosts.ini playbooks/99-final-fixes.yml
-      
-      - name: 📥 Fetch Kubeconfig
-        continue-on-error: true
-        run: |
-          BASTION_IP=$(cat /tmp/terraform-outputs/bastion_ip.txt)
-          scp -i ~/.ssh/petclinic-test-key.pem -o StrictHostKeyChecking=no \
-            ubuntu@${BASTION_IP}:~/.kube/config /tmp/kubeconfig || echo "Kubeconfig fetch failed"
-      
-      - name: 📦 Upload Kubeconfig
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: kubeconfig
-          path: /tmp/kubeconfig
-          retention-days: 7
-        continue-on-error: true
-      
-      - name: 🎉 Final Summary
-        if: always()
-        run: |
-          BASTION_IP=$(cat /tmp/terraform-outputs/bastion_ip.txt)
-          LB_DNS=$(cat /tmp/terraform-outputs/lb_dns.txt)
-          
-          echo ""
-          echo "╔════════════════════════════════════════╗"
-          echo "║     Kubernetes Cluster Ready!        ║"
-          echo "╚════════════════════════════════════════╝"
-          echo ""
-          echo "Connection Info:"
-          echo "  Bastion: ${BASTION_IP}"
-          echo "  API:     ${LB_DNS}:6443"
-          echo ""
-          echo "SSH Access:"
-          echo "  ssh -i petclinic-test-key.pem ubuntu@${BASTION_IP}"
-          echo ""
-          echo "Verify cluster:"
-          echo "  kubectl get nodes"
-          echo "  kubectl get pods -A"
-          echo ""
+    - name: Display initialization status
+      debug:
+        msg: "Kubernetes is {{ 'already initialized' if k8s_initialized.stat.exists else 'NOT initialized' }}"
 
+    - block:
+        # تنظيف أي محاولات فاشلة سابقة
+        - name: Clean any previous failed attempts
+          shell: |
+            kubeadm reset -f || true
+            rm -rf /etc/kubernetes/* || true
+            rm -rf /var/lib/etcd/* || true
+          changed_when: true
+
+        - name: Ensure required directories exist
+          file:
+            path: "{{ item }}"
+            state: directory
+            mode: '0755'
+          loop:
+            - /etc/kubernetes
+            - /var/lib/etcd
+            - /var/log/kubernetes
+
+        - name: Create kubeadm configuration file
+          template:
+            src: ../templates/kubeadm-config.yml.j2
+            dest: "{{ kubeadm_config_file }}"
+            mode: '0644'
+
+        - name: Display kubeadm config
+          command: cat {{ kubeadm_config_file }}
+          register: kubeadm_config_content
+          changed_when: false
+
+        - name: Show kubeadm configuration
+          debug:
+            msg: "{{ kubeadm_config_content.stdout_lines }}"
+
+        # إعادة تشغيل الخدمات
+        - name: Restart container runtime
+          systemd:
+            name: containerd
+            state: restarted
+            daemon_reload: yes
+
+        - name: Wait for containerd to be ready
+          wait_for:
+            path: /var/run/containerd/containerd.sock
+            state: present
+            timeout: 60
+
+        - name: Initialize Kubernetes cluster
+          command: >
+            kubeadm init
+            --config {{ kubeadm_config_file }}
+            --upload-certs
+            --v=5
+          register: kubeadm_init_output
+          async: "{{ kubeadm_init_timeout }}"
+          poll: 15
+          retries: 2
+          delay: 30
+          until: kubeadm_init_output.rc == 0
+
+        - name: Display kubeadm init output
+          debug:
+            msg: "{{ kubeadm_init_output.stdout_lines }}"
+          when: kubeadm_init_output.stdout is defined
+
+        - name: Save kubeadm init output
+          copy:
+            content: "{{ kubeadm_init_output.stdout }}"
+            dest: /tmp/kubeadm-init-output.txt
+            mode: '0644'
+
+        - name: Extract join commands
+          shell: |
+            # Extract control-plane join command
+            grep -A 3 "kubeadm join.*--control-plane" /tmp/kubeadm-init-output.txt > /tmp/master-join-command.sh || true
+
+            # Extract worker join command
+            grep -A 1 "kubeadm join" /tmp/kubeadm-init-output.txt | grep -v "control-plane" | tail -3 > /tmp/worker-join-command.sh || true
+          args:
+            executable: /bin/bash
+
+        - name: Create .kube directory for root
+          file:
+            path: /root/.kube
+            state: directory
+            mode: '0755'
+
+        - name: Copy admin.conf to root's kubeconfig
+          copy:
+            src: /etc/kubernetes/admin.conf
+            dest: /root/.kube/config
+            remote_src: yes
+            mode: '0644'
+
+        - name: Create .kube directory for ubuntu user
+          file:
+            path: /home/ubuntu/.kube
+            state: directory
+            owner: ubuntu
+            group: ubuntu
+            mode: '0755'
+
+        - name: Copy admin.conf to ubuntu user
+          copy:
+            src: /etc/kubernetes/admin.conf
+            dest: /home/ubuntu/.kube/config
+            remote_src: yes
+            owner: ubuntu
+            group: ubuntu
+            mode: '0644'
+
+        - name: Wait for API server to be ready
+          command: kubectl get --raw /healthz
+          register: api_health
+          until: api_health.rc == 0
+          retries: 60
+          delay: 10
+          changed_when: false
+
+        - name: Update kubeconfig to use NLB endpoint
+          shell: |
+            # Update server URL in admin.conf to use NLB
+            sed -i "s|server: https://{{ ansible_default_ipv4.address }}:{{ api_server_port }}|server: https://{{ control_plane_endpoint }}|g" /etc/kubernetes/admin.conf
+            
+            # Update in root kubeconfig
+            sed -i "s|server: https://{{ ansible_default_ipv4.address }}:{{ api_server_port }}|server: https://{{ control_plane_endpoint }}|g" /root/.kube/config
+            
+            # Update in ubuntu kubeconfig
+            sed -i "s|server: https://{{ ansible_default_ipv4.address }}:{{ api_server_port }}|server: https://{{ control_plane_endpoint }}|g" /home/ubuntu/.kube/config
+          changed_when: true
+
+        - name: Wait before updating kubeadm config
+          pause:
+            seconds: 10
+
+        - name: Update kubeadm ClusterConfiguration to use NLB
+          shell: |
+            # Use the local API server endpoint temporarily
+            export KUBECONFIG=/etc/kubernetes/admin.conf
+            kubectl config set-cluster {{ cluster_name }}-{{ env_name }} --server=https://{{ ansible_default_ipv4.address }}:{{ api_server_port }}
+            
+            # Update the configmap
+            kubectl -n kube-system get configmap kubeadm-config -o yaml | \
+              sed "s|controlPlaneEndpoint: {{ ansible_default_ipv4.address }}:{{ api_server_port }}|controlPlaneEndpoint: {{ control_plane_endpoint }}|g" | \
+              kubectl apply -f -
+            
+            # Switch back to NLB in kubeconfig
+            kubectl config set-cluster {{ cluster_name }}-{{ env_name }} --server=https://{{ control_plane_endpoint }}
+          changed_when: true
+          ignore_errors: yes
+
+        - name: Wait for nodes
+          command: kubectl get nodes
+          register: kubectl_get_nodes
+          until: kubectl_get_nodes.rc == 0
+          retries: 30
+          delay: 10
+          changed_when: false
+
+        - name: Display cluster nodes
+          debug:
+            msg: "{{ kubectl_get_nodes.stdout_lines }}"
+
+        - name: Get cluster info
+          command: kubectl cluster-info
+          register: cluster_info
+          changed_when: false
+
+        - name: Display cluster info
+          debug:
+            msg: "{{ cluster_info.stdout_lines }}"
+
+      when: not k8s_initialized.stat.exists
+      rescue:
+        - name: Show failure details
+          debug:
+            msg: 
+              - "Kubeadm init failed!"
+              - "Check logs with: journalctl -xeu kubelet"
+              - "Check containers: crictl ps -a"
+
+        - name: Get kubelet logs
+          command: journalctl -xeu kubelet --no-pager -n 100
+          register: kubelet_logs
+          changed_when: false
+
+        - name: Display kubelet logs
+          debug:
+            msg: "{{ kubelet_logs.stdout_lines }}"
+
+        - fail:
+            msg: "Kubernetes initialization failed. Check the logs above."
+
+    - name: Fetch admin.conf to local machine
+      fetch:
+        src: /etc/kubernetes/admin.conf
+        dest: /tmp/kubernetes-admin.conf
+        flat: yes
+
+    - name: Fetch join commands to local machine
+      fetch:
+        src: "/tmp/{{ item }}"
+        dest: "/tmp/{{ item }}"
+        flat: yes
+      loop:
+        - master-join-command.sh
+        - worker-join-command.sh
+      ignore_errors: yes
+
+  post_tasks:
+    - name: Summary - First master initialized
+      debug:
+        msg: |
+          ═══════════════════════════════════════════
+          ✅ First Master Initialized Successfully!
+          ═══════════════════════════════════════════
+          Master: {{ ansible_hostname }}
+          Control Plane Endpoint: {{ control_plane_endpoint }}
+
+          ℹ️  Cluster initialized on local IP, then switched to NLB
+          
+          Next Steps:
+          1. Join other masters: ansible-playbook 03-join-masters.yml
+          2. Join workers: ansible-playbook 04-join-workers.yml
+          3. Install CNI: ansible-playbook 05-install-cni.yml
+
+          Admin kubeconfig saved to: /tmp/kubernetes-admin.conf
