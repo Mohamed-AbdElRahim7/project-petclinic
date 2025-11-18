@@ -1,5 +1,5 @@
 #!/bin/bash
-set +e   # ⛔ ممنوع توقف على أول error
+set +e   # ممنوع يقف عند أول error
 
 # ===== Logging =====
 exec > >(tee /var/log/user-data.log)
@@ -108,6 +108,9 @@ systemctl daemon-reload
 systemctl enable kubelet
 systemctl restart kubelet || true
 
+echo "[STEP] Pre-pull Kubernetes images (important)"
+retry kubeadm config images pull --kubernetes-version v1.28.0
+
 echo "[STEP] Install AWS CLI"
 cd /tmp
 retry curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" \
@@ -120,7 +123,7 @@ echo "[STEP] Install CloudWatch Agent"
 cd /tmp
 retry wget -q https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazoncloudwatch-agent.deb
 dpkg -i -E amazoncloudwatch-agent.deb || true
-rm -f amazoncloud-agent.deb
+rm -f amazoncloudwatch-agent.deb
 
 echo "════════════════════════════════════════"
 echo "User-Data Complete: $(date)"
