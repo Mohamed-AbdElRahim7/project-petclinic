@@ -9,8 +9,6 @@
 
   vars:
     kubeadm_config_file: /tmp/kubeadm-config.yaml
-    # control_plane_endpoint بييجي من group_vars/all.yml
-    # و GitHub Actions بتعدله لـ NLB DNS:6443
 
   tasks:
     - name: Check if Kubernetes is already initialized
@@ -47,6 +45,38 @@
           async: "{{ kubeadm_init_timeout }}"
           poll: 10
 
+        # 🔥🔥🔥 Added Debug Block (FULL) 🔥🔥🔥
+        - name: Debug kubelet and apiserver if kubeadm init fails
+          shell: |
+            echo "===== KUBELET STATUS ====="
+            systemctl status kubelet --no-pager || true
+            echo ""
+
+            echo "===== KUBELET LOGS (last 50 lines) ====="
+            journalctl -xeu kubelet | tail -50 || true
+            echo ""
+
+            echo "===== CONTAINERD CRI (kube-* pods) ====="
+            crictl --runtime-endpoint unix:///var/run/containerd/containerd.sock ps -a || true
+            echo ""
+
+            echo "===== LOGS FOR kube-apiserver (if exists) ====="
+            APISERVER_ID=$(crictl --runtime-endpoint unix:///var/run/containerd/containerd.sock ps -a | grep kube-apiserver | awk '{print $1}')
+            if [ ! -z "$APISERVER_ID" ]; then
+              crictl --runtime-endpoint unix:///var/run/containerd/containerd.sock logs $APISERVER_ID | tail -100
+            else
+              echo "kube-apiserver container not found."
+            fi
+          register: kubelet_debug_output
+          when: kubeadm_init_output.rc != 0
+          ignore_errors: true
+
+        - name: Show kubelet debug output
+          debug:
+            msg: "{{ kubelet_debug_output.stdout_lines }}"
+          when: kubeadm_init_output.rc != 0
+        # 🔥🔥🔥 END Debug Block 🔥🔥🔥
+
         - name: Display kubeadm init output
           debug:
             msg: "{{ kubeadm_init_output.stdout_lines }}"
@@ -59,10 +89,7 @@
 
         - name: Extract join commands
           shell: |
-            # Extract control-plane join command
             grep -A 3 "kubeadm join.*--control-plane" /tmp/kubeadm-init-output.txt > /tmp/master-join-command.sh || true
-
-            # Extract worker join command
             grep -A 1 "kubeadm join" /tmp/kubeadm-init-output.txt | grep -v "control-plane" | tail -3 > /tmp/worker-join-command.sh || true
           args:
             executable: /bin/bash
