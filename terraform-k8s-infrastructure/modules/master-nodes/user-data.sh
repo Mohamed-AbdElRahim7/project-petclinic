@@ -64,8 +64,25 @@ sysctl --system
 echo "[STEP] Install containerd"
 retry apt-get install -y containerd
 mkdir -p /etc/containerd
-containerd config default > /etc/containerd/config.toml
-sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+
+echo "[STEP] Apply containerd drop-in FIX (pause:3.9 + SystemdCgroup=true)"
+cat <<EOF >/etc/containerd/config.toml
+version = 2
+
+[plugins."io.containerd.grpc.v1.cri"]
+  sandbox_image = "registry.k8s.io/pause:3.9"
+
+  [plugins."io.containerd.grpc.v1.cri".containerd]
+    default_runtime_name = "runc"
+
+  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+    runtime_type = "io.containerd.runc.v2"
+
+    [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+      SystemdCgroup = true
+EOF
+
+systemctl daemon-reload
 systemctl restart containerd
 systemctl enable containerd
 
