@@ -86,6 +86,11 @@ systemctl daemon-reload
 systemctl restart containerd
 systemctl enable containerd
 
+echo "[STEP] Configure kubelet to use containerd + systemd cgroup"
+cat <<EOF >/etc/default/kubelet
+KUBELET_EXTRA_ARGS="--container-runtime=remote --container-runtime-endpoint=unix:///var/run/containerd/containerd.sock --cgroup-driver=systemd"
+EOF
+
 echo "[STEP] Install Kubernetes repo"
 mkdir -p /etc/apt/keyrings
 retry curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.28/deb/Release.key \
@@ -98,7 +103,10 @@ https://pkgs.k8s.io/core:/stable:/v1.28/deb/ /" \
 retry apt-get update -y
 retry apt-get install -y kubelet kubeadm kubectl
 apt-mark hold kubelet kubeadm kubectl
+
+systemctl daemon-reload
 systemctl enable kubelet
+systemctl restart kubelet || true
 
 echo "[STEP] Install AWS CLI"
 cd /tmp
@@ -112,7 +120,7 @@ echo "[STEP] Install CloudWatch Agent"
 cd /tmp
 retry wget -q https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazoncloudwatch-agent.deb
 dpkg -i -E amazoncloudwatch-agent.deb || true
-rm -f amazoncloudwatch-agent.deb
+rm -f amazoncloud-agent.deb
 
 echo "════════════════════════════════════════"
 echo "User-Data Complete: $(date)"
